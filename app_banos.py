@@ -1,136 +1,128 @@
-
-
 import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import datetime
 import io
 
-# --- CONFIGURACIÓN ESTÉTICA ---
+# --- CONFIGURACIÓN ---
 st.set_page_config(page_title="Latin Servicios", layout="wide")
 
-st.markdown("""
-    <style>
-    .stApp { background-color: #F5F5DC; }
-    h1, h2, h3, p, label { color: #000000 !important; }
-    div.stButton > button { 
-        background-color: #8DB600; color: black; font-weight: bold; border: 2px solid black; width: 100%;
-    }
-    .stTabs [aria-selected="true"] { background-color: #8DB600 !important; color: white !important; }
-    </style>
-    """, unsafe_allow_html=True)
-
 # --- BASE DE DATOS ---
-conn = sqlite3.connect('latin_servicios_completo.db', check_same_thread=False)
+conn = sqlite3.connect('latin_servicios_v5.db', check_same_thread=False)
 c = conn.cursor()
 
-# Tablas existentes y nueva tabla de Stock
 c.execute('CREATE TABLE IF NOT EXISTS usuarios (user TEXT PRIMARY KEY, password TEXT, rol TEXT)')
 c.execute('CREATE TABLE IF NOT EXISTS vehiculos (patente TEXT PRIMARY KEY, modelo TEXT)')
 c.execute('''CREATE TABLE IF NOT EXISTS viajes 
              (id INTEGER PRIMARY KEY, fecha TEXT, cliente TEXT, patente TEXT, 
-              precio REAL, estado_pago TEXT, destino TEXT, tipo_mov TEXT, cantidad INTEGER, modelo_bano TEXT)''')
-c.execute('CREATE TABLE IF NOT EXISTS stock_playa (id INTEGER PRIMARY KEY, modelo TEXT, color TEXT, cantidad INTEGER)')
+              destino TEXT, tipo_mov TEXT, unidades TEXT, cantidad INTEGER, 
+              tipo_contrato TEXT, km_entrega REAL, precio_unit REAL, total REAL, estado_pago TEXT)''')
+c.execute('CREATE TABLE IF NOT EXISTS stock_playa (nro_unit TEXT PRIMARY KEY, modelo TEXT, estado TEXT)')
 
 c.execute("INSERT OR IGNORE INTO usuarios VALUES ('admin', 'admin123', 'Administrador')")
 conn.commit()
 
-# --- SESIÓN ---
-if 'login' not in st.session_state:
-    st.session_state['login'] = False
-    st.session_state['user'] = ""
-    st.session_state['rol'] = ""
+# --- LOGIN ---
+if 'login' not in st.session_state: st.session_state.login = False
 
-if not st.session_state['login']:
-    st.markdown("<h1 style='text-align: center; color: #8DB600;'>🚚 LATIN SERVICIOS</h1>", unsafe_allow_html=True)
+if not st.session_state.login:
+    st.markdown("<h1 style='text-align: center;'>🚚 LATIN SERVICIOS</h1>", unsafe_allow_html=True)
     u = st.text_input("Usuario")
-    p = st.text_input("Contraseña", type="password")
+    p = st.text_input("Clave", type="password")
     if st.button("INGRESAR"):
         c.execute("SELECT rol FROM usuarios WHERE user=? AND password=?", (u, p))
         res = c.fetchone()
         if res:
-            st.session_state['login'] = True
-            st.session_state['user'] = u
-            st.session_state['rol'] = res[0]
+            st.session_state.login, st.session_state.rol = True, res[0]
             st.rerun()
-        else: st.error("Error")
 else:
-    # --- CÁLCULOS DE STOCK ---
-    # Stock en Calle
-    df_viajes = pd.read_sql_query("SELECT tipo_mov, cantidad FROM viajes", conn)
-    calle = (df_viajes[df_viajes['tipo_mov'] == 'Entregado']['cantidad'].sum() - 
-             df_viajes[df_viajes['tipo_mov'] == 'Retirado']['cantidad'].sum()) if not df_viajes.empty else 0
+    tabs = st.tabs(["📋 CARGAS", "📊 HISTORIAL", "📦 STOCK/UNIDADES", "🚛 VEHÍCULOS", "👥 USUARIOS"])
 
-    st.sidebar.title("LATIN SERVICIOS")
-    st.sidebar.metric("En la Calle", calle)
-    if st.sidebar.button("Cerrar Sesión"):
-        st.session_state['login'] = False
-        st.rerun()
-
-    # --- PESTAÑAS ---
-    pestañas = ["📋 CARGAS", "📊 HISTORIAL", "📦 STOCK EN PLAYA", "🚛 VEHÍCULOS", "👥 USUARIOS"]
-    tabs = st.tabs(pestañas) if st.session_state['rol'] == "Administrador" else st.tabs(pestañas[:2])
-
-    # --- PESTAÑA 1: CARGAS (CON ACTUALIZACIÓN DE STOCK) ---
+    # 1. CARGAS (MULTIPLE Y TIPO CONTRATO)
     with tabs[0]:
-        st.header("Registrar Movimiento")
+        st.header("Registro de Movimiento")
         v_list = pd.read_sql_query("SELECT patente FROM vehiculos", conn)['patente'].tolist()
-        m_list = pd.read_sql_query("SELECT modelo || ' (' || color || ')' as item FROM stock_playa", conn)['item'].tolist()
+        
+        mov = st.radio("Acción", ["Entregado", "Retirado"], horizontal=True)
+        estado_filtro = "En Playa" if mov == "Entregado" else "En Calle"
+        
+        # Obtenemos unidades disponibles según el movimiento
+        u_dispo = pd.read_sql_query(f"SELECT nro_unit FROM stock_playa WHERE estado='{estado_filtro}'", conn)['nro_unit'].tolist()
         
         with st.form("form_viajes"):
-            c1, c2 = st.columns(2)
-            with c1:
-                f_cli = st.text_input("Cliente")
-                f_tipo = st.radio("Movimiento", ["Entregado", "Retirado"], horizontal=True)
-                f_mod = st.selectbox("Modelo de Baño", m_list if m_list else ["Cargar stock en pestaña Playa"])
-            with c2:
-                f_cant = st.number_input("Cantidad", min_value=1, value=1)
-                f_pat = st.selectbox("Vehículo", v_list if v_list else ["Cargar Vehículo"])
-                f_dest = st.text_input("Destino")
+            col1, col2 = st.columns(2)
+            with col1:
+                f_cli = st.text_input("Cliente / Nombre del Evento")
+                f_dest = st.text_input("Dirección / Ubicación")
+                f_tipo_c = st.selectbox("Tipo de Contratación", ["Mensual (Obra)", "Eventual (Evento)"])
+                f_km = st.number_input("Km Recorridos", min_value=0.0)
+            with col2:
+                # AQUÍ SE PUEDEN ELEGIR MUCHAS UNIDADES
+                f_units = st.multiselect("Seleccionar Unidades", u_dispo)
+                f_pat = st.selectbox("Vehículo", v_list)
+                f_prec = st.number_input("Precio por unidad ($)", min_value=0.0)
+                f_pago = st.selectbox("Estado Pago", ["Pendiente", "Pagado"])
             
-            if st.form_submit_button("GUARDAR Y ACTUALIZAR STOCK"):
-                if v_list and m_list:
-                    # Guardar Viaje
-                    c.execute('''INSERT INTO viajes (fecha, cliente, patente, precio, estado_pago, destino, tipo_mov, cantidad, modelo_bano) 
-                                 VALUES (?,?,?,?,?,?,?,?,?)''',
-                              (datetime.now().strftime("%d/%m/%Y"), f_cli, f_pat, 0, 'Pendiente', f_dest, f_tipo, f_cant, f_mod))
+            if st.form_submit_button("GUARDAR MOVIMIENTO"):
+                if f_units and v_list:
+                    cant = len(f_units)
+                    total_viaje = cant * f_prec
+                    str_units = ", ".join(f_units)
+                    nuevo_estado = "En Calle" if mov == "Entregado" else "En Playa"
                     
-                    # Actualizar Playa (Si entrego, resto. Si retiro, sumo)
-                    mod_nombre = f_mod.split(' (')[0]
-                    color_nombre = f_mod.split('(')[1].replace(')', '')
-                    operacion = "-" if f_tipo == "Entregado" else "+"
-                    c.execute(f"UPDATE stock_playa SET cantidad = cantidad {operacion} ? WHERE modelo = ? AND color = ?", 
-                              (f_cant, mod_nombre, color_nombre))
+                    c.execute("""INSERT INTO viajes (fecha, cliente, patente, destino, tipo_mov, 
+                              unidades, cantidad, tipo_contrato, km_entrega, precio_unit, total, estado_pago) 
+                              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                              (datetime.now().strftime("%d/%m/%Y"), f_cli, f_pat, f_dest, mov, 
+                               str_units, cant, f_tipo_c, f_km, f_prec, total_viaje, f_pago))
+                    
+                    # Actualizamos el estado de cada unidad seleccionada
+                    for unit in f_units:
+                        c.execute("UPDATE stock_playa SET estado = ? WHERE nro_unit = ?", (nuevo_estado, unit))
                     
                     conn.commit()
-                    st.success(f"Movimiento registrado. Stock en playa actualizado.")
+                    st.success(f"✅ Registrado: {cant} unidades como {nuevo_estado}. Total: ${total_viaje}")
                     st.rerun()
 
-    # --- PESTAÑA 3: STOCK EN PLAYA (GESTIÓN) ---
-    with tabs[2]:
-        st.header("Inventario en Depósito (Playa)")
-        col_s1, col_s2 = st.columns([1, 2])
-        
-        with col_s1:
-            st.subheader("Cargar Nuevo Modelo")
-            n_mod = st.text_input("Modelo (ej: Lujo, Obra)")
-            n_col = st.text_input("Color (ej: Azul, Verde)")
-            n_can = st.number_input("Cantidad Inicial", min_value=0)
-            if st.button("AGREGAR A PLAYA"):
-                c.execute("INSERT INTO stock_playa (modelo, color, cantidad) VALUES (?,?,?)", (n_mod, n_col, n_can))
-                conn.commit()
-                st.rerun()
-        
-        with col_s2:
-            st.subheader("Estado Actual en Playa")
-            df_playa = pd.read_sql_query("SELECT modelo, color, cantidad FROM stock_playa", conn)
-            st.table(df_playa)
-            if st.button("Resetear Stock (Admin)"):
-                c.execute("DELETE FROM stock_playa")
-                conn.commit()
-                st.rerun()
-
-    # --- RESTO DE PESTAÑAS (HISTORIAL, VEHÍCULOS, USUARIOS) ---
+    # 2. HISTORIAL
     with tabs[1]:
-        st.header("Historial")
-        st.dataframe(pd.read_sql_query("SELECT * FROM viajes", conn), use_container_width=True)
+        st.header("Historial y Reportes")
+        df_h = pd.read_sql_query("SELECT * FROM viajes", conn)
+        st.dataframe(df_h, use_container_width=True)
+        if not df_h.empty:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+                df_h.to_excel(writer, index=False)
+            st.download_button("📥 DESCARGAR EXCEL", output.getvalue(), "Reporte_Latin.xlsx")
+
+    # 3. STOCK
+    with tabs[2]:
+        st.header("Control de Unidades Físicas")
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.subheader("Alta de Baño")
+            nu = st.text_input("Nº de Unidad (Ej: B-01)")
+            mod = st.text_input("Modelo")
+            if st.button("Guardar en Sistema"):
+                c.execute("INSERT OR IGNORE INTO stock_playa VALUES (?,?,'En Playa')", (nu, mod))
+                conn.commit()
+                st.rerun()
+        with c2:
+            st.subheader("Estado de la Flota")
+            st.table(pd.read_sql_query("SELECT * FROM stock_playa", conn))
+
+    # 4 y 5 (Vehículos y Usuarios se mantienen igual)
+    with tabs[3]:
+        p = st.text_input("Nueva Patente").upper()
+        if st.button("Cargar"):
+            c.execute("INSERT OR IGNORE INTO vehiculos VALUES (?,?)", (p, "Unidad"))
+            conn.commit(); st.rerun()
+        st.table(pd.read_sql_query("SELECT * FROM vehiculos", conn))
+
+    with tabs[4]:
+        un = st.text_input("Usuario")
+        pn = st.text_input("Clave", type="password")
+        if st.button("Crear"):
+            c.execute("INSERT OR IGNORE INTO usuarios VALUES (?,?,'Operador')", (un, pn))
+            conn.commit(); st.rerun()
+        st.table(pd.read_sql_query("SELECT user, rol FROM usuarios", conn))
