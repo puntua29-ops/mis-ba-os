@@ -13,8 +13,10 @@ import os
 try:
     from streamlit_gsheets import GSheetsConnection
     HAS_GSHEETS = True
-except ImportError:
+    GSHEETS_ERR = None
+except Exception as e:
     HAS_GSHEETS = False
+    GSHEETS_ERR = str(e)
 
 # --- CONFIGURACIÓN ESTÉTICA ---
 st.set_page_config(page_title="Servicios de Logística", layout="wide")
@@ -39,7 +41,8 @@ def get_db_connection():
         return sqlite3.connect('gestion_banos.db', check_same_thread=False, timeout=30)
     else:
         if not HAS_GSHEETS:
-            st.error("❌ Error: La librería 'st-gsheets-connection' no está instalada. Ejecuta 'pip install st-gsheets-connection' en tu terminal.")
+            st.error(f"❌ Error de Librería: {GSHEETS_ERR}")
+            st.info("Para solucionar esto en la Nube, asegúrate de que 'st-gsheets-connection' esté en el archivo 'requirements.txt'.")
             return None
         # En la nube usamos st.connection para Google Sheets
         try:
@@ -137,8 +140,13 @@ def run_query(query, params=(), commit=False):
             err_msg = str(e)
             if "Worksheet not found" in err_msg:
                 return []
-            if "PERMISSION_DENIED" in err_msg or "403" in err_msg:
-                st.error(f"🚫 Error de Permisos en '{tabla_target}': Asegúrate de haber compartido el Excel con el email de la Service Account como 'EDITOR'.")
+            if "Worksheet not found" in err_msg:
+                return []
+            if "PERMISSION_DENIED" in err_msg or "403" in err_msg or "PermissionError" in type(e).__name__:
+                st.error(f"🚫 **Error de Permisos en Google Sheets**")
+                st.info(f"Para solucionar esto, comparte tu Excel con este correo (como **Editor**):")
+                st.code("servicio-app-logistica@simba-agent.iam.gserviceaccount.com")
+                st.markdown("👉 [Abrir mi Excel para compartir](https://docs.google.com/spreadsheets/d/1gBCViKkKxdVZS7XP_uv3xVW3UHqr8VUcaOJ2xCuuP3E/)")
             else:
                 st.error(f"❌ Error en GSheets ({tabla_target}): {err_msg}")
             return []
