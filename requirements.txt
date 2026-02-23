@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.32.0
 pandas
 geopy
 folium
@@ -7,3 +7,5 @@ openpyxl
 xlsxwriter
 st-gsheets-connection
 duckdb
+google-auth
+gspread
