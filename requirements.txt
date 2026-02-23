@@ -3,5 +3,4 @@ pandas
 geopy
 openpyxl
 xlsxwriter
-folium
-streamlit-folium
+st-gsheets-connection
