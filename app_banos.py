@@ -219,7 +219,7 @@ def init_db():
                         st.error(f"❌ No se pudo crear la pestaña '{nombre}': {e2}")
                         raise e2
                 else:
-                    st.error(f"❌ Error al verificar pestaña '{nombre}': {e}")
+                    st.error(f"❌ Error al verificar pestaña '{nombre}': [{type(e).__name__}] {e}")
                     raise e
 
 # Ejecutar inicialización al arranque
@@ -304,16 +304,17 @@ if not st.session_state.login:
                                     detalles_errores.append(f"**{t}**: {msg}")
                         
                         st.write(f"**Pestañas detectadas:** {', '.join(encontradas) if encontradas else 'NINGUNA'}")
-                        
                         if detalles_errores:
                             with st.expander("🔍 Ver detalles técnicos de los errores"):
                                 for d in detalles_errores: st.write(d)
                         
-                        if not encontradas:
-                            st.error("🚨 La app no encuentra las hojas en tu Excel.")
-                            st.info("Esto suele pasar por 2 motivos:\n1. Falta habilitar la **Google Drive API** (no solo la de Sheets).\n2. El Excel está vacío (solo tiene 'Hoja 1').")
+                        st.error("🚨 La app no encuentra las hojas en tu Excel.")
+                        st.info("Para solucionar esto:\n1. Asegúrate de que tu Excel tenga una pestaña llamada **usuarios** abajo.\n2. Asegúrate de haber habilitado **Google Drive API** además de Sheets API en Google Cloud Console.")
+                        if detalles_errores:
+                            with st.expander("🔍 Ver detalles técnicos de los errores"):
+                                for d in detalles_errores: st.write(d)
                     except Exception as e:
-                        st.error(f"Error al analizar el Excel: {e}")
+                        st.error(f"Error al analizar el Excel: [{type(e).__name__}] {e}")
                 except Exception as e:
                     st.error(f"Error en diagnóstico: {e}")
             else:
