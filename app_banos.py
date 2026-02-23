@@ -10,7 +10,8 @@ import os
 import hashlib
 import threading
 
-import database
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # ─────────────────────────────────────────────
 # CONFIGURACIÓN ESTÉTICA
@@ -35,9 +36,18 @@ def hash_password(password: str) -> str:
 # CAPA DE BASE DE DATOS (SUPABASE)
 # ─────────────────────────────────────────────
 
+def get_connection():
+    return psycopg2.connect(
+        host="aws-0-us-west-2.pooler.supabase.com",
+        database="postgres",
+        user="postgres.veswcqamiqyugxwtsrng",
+        password="@Lex2110valentino",
+        port=6543
+    )
+
 def run_query(query, params=(), commit=False):
     """Ejecuta una query en Supabase de forma segura."""
-    # Convertir '?' (SQLite style) a '%s' (psycopg2 style) para compatibilidad si es necesario
+    # Convertir '?' (SQLite style) a '%s' (psycopg2 style) para compatibilidad
     query = query.replace('?', '%s')
     
     # Manejar el nombre reservado "user" en Postgres
@@ -47,11 +57,26 @@ def run_query(query, params=(), commit=False):
     query = query.replace('SELECT user, rol, sucursal', 'SELECT "user", rol, sucursal')
     query = query.replace('FROM usuarios WHERE user=', 'FROM usuarios WHERE "user"=')
     
+    conn = None
     try:
-        return database.run_query(query, params, fetch=not commit)
+        conn = get_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(query, params)
+        
+        result = None
+        if not commit:
+            result = cur.fetchall()
+        
+        conn.commit()
+        return result
     except Exception as e:
+        if conn:
+            conn.rollback()
         st.error(f"❌ Error en Base de Datos: {e}")
         return []
+    finally:
+        if conn:
+            conn.close()
 
 def _init_db_once():
     """Inicialización legacy (ahora manejada por Supabase)."""
