@@ -131,8 +131,13 @@ def run_query(query, params=(), commit=False):
                     return False
                 return True
         except Exception as e:
-            if "Worksheet not found" in str(e): return []
-            st.error(f"Error en GSheets ({tabla_target}): {e}")
+            err_msg = str(e)
+            if "Worksheet not found" in err_msg:
+                return []
+            if "PERMISSION_DENIED" in err_msg or "403" in err_msg:
+                st.error(f"🚫 Error de Permisos en '{tabla_target}': Asegúrate de haber compartido el Excel con el email de la Service Account como 'EDITOR'.")
+            else:
+                st.error(f"❌ Error en GSheets ({tabla_target}): {err_msg}")
             return []
 
 # Inicialización de Tablas
@@ -210,7 +215,13 @@ try:
     init_db()
 except Exception as e:
     if IS_CLOUD:
-        st.warning(f"⚠️ Nota: No se pudo inicializar/verificar Google Sheets (Posible modo Solo Lectura). Detalles: {e}")
+        err_str = str(e)
+        if "403" in err_str or "PERMISSION_DENIED" in err_str:
+            st.error("🔒 Error de Acceso: No tienes permisos de escritura en el Google Sheets. Por favor, comparte el Excel con el email de la 'Service Account' dándole permiso de EDITOR.")
+        elif "UnsupportedOperationError" in err_str:
+            st.error("🔒 Conexión de Solo Lectura: Has configurado el Spreadsheet pero no los permisos de escritura (Service Account).")
+        else:
+            st.warning(f"⚠️ Nota: Problema al conectar Google Sheets. Detalles: {err_str}")
     else:
         st.error(f"Error al inicializar base de datos: {e}")
 
@@ -228,15 +239,44 @@ if not st.session_state.login:
         u = st.text_input("Usuario")
         p = st.text_input("Contraseña", type="password")
         if st.button("INGRESAR", use_container_width=True):
-            res = run_query("SELECT rol, sucursal FROM usuarios WHERE user=? AND password=?", (u, p))
-            if res:
-                st.session_state.login = True
-                st.session_state.rol = res[0][0]
-                st.session_state.sucursal = res[0][1]
-                st.session_state.user = u
-                st.rerun()
-            else: 
-                st.error("Acceso incorrecto")
+            with st.spinner("Verificando..."):
+                res = run_query("SELECT rol, sucursal FROM usuarios WHERE user=? AND password=?", (u, p))
+                if res:
+                    st.session_state.login = True
+                    st.session_state.rol = res[0][0]
+                    st.session_state.sucursal = res[0][1]
+                    st.session_state.user = u
+                    st.rerun()
+                else: 
+                    # Verificar si es por usuario inexistente o error de conexión
+                    check_user = run_query("SELECT user FROM usuarios")
+                    if not check_user:
+                        st.error("🚫 Error: No se encontraron usuarios en la base de datos. Es posible que el Service Account no tenga permisos de escritura para crear el usuario 'admin' inicial.")
+                    else:
+                        st.error("❌ Usuario o contraseña incorrectos")
+
+    # --- SECCIÓN DE DIAGNÓSTICO (Solo visible si hay problemas) ---
+    with st.expander("🛠️ Diagnóstico de Conexión (Click aquí si nada funciona)"):
+        st.write(f"**Entorno:** {'Nube (Cloud)' if IS_CLOUD else 'Local (PC)'}")
+        st.write(f"**Librería GSheets:** {'✅ Instalada' if HAS_GSHEETS else '❌ No encontrada'}")
+        if IS_CLOUD:
+            conn = get_db_connection()
+            if conn:
+                st.success("✅ Conexión con Google establecida")
+                try:
+                    # Intentar ver qué pestañas existen
+                    tablas_cloud = ["usuarios", "vehiculos", "viajes", "stock_playa", "personal", "gastos"]
+                    encontradas = []
+                    for t in tablas_cloud:
+                        try:
+                            conn.read(worksheet=t, ttl=0)
+                            encontradas.append(t)
+                        except: pass
+                    st.write(f"**Pestañas encontradas:** {', '.join(encontradas) if encontradas else 'Ninguna (Asegúrate de que existan o que el permiso de Editor esté bien puesto)'}")
+                except Exception as e:
+                    st.error(f"Error al leer pestañas: {e}")
+            else:
+                st.error("❌ No se pudo conectar con Google Sheets. Revisa los 'Secrets' en Streamlit Cloud.")
 else:
     with st.sidebar:
         st.title("SERVICIOS DE LOGÍSTICA")
