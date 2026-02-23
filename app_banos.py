@@ -76,7 +76,10 @@ def run_query(query, params=(), commit=False):
             return []
 
         try:
-            df = conn.read(worksheet=tabla_target)
+            df = conn.read(worksheet=tabla_target, ttl=0)
+            if df is None or df.empty: 
+                # Si llega aquí, es que existe pero no tiene datos
+                return []
             
             if "select" in q_lower:
                 df_res = df.copy()
@@ -196,19 +199,28 @@ def init_db():
         }
         for nombre, cols in tablas.items():
             try:
-                df_actual = conn.read(worksheet=nombre)
+                # Intentar leer para ver si existe
+                df_actual = conn.read(worksheet=nombre, ttl=0)
                 # MIGRACIÓN: Si faltan columnas (como 'sucursal'), las agregamos
                 missing = [c for c in cols if c not in df_actual.columns]
                 if missing:
                     for c in missing:
                         df_actual[c] = "Todas" if nombre == "usuarios" else "Sucursal A"
                     conn.update(worksheet=nombre, data=df_actual)
-            except Exception:
-                # Si no existe, crear con cabeceras
-                df_init = pd.DataFrame(columns=cols)
-                if nombre == "usuarios":
-                    df_init.loc[0] = ["admin", "admin123", "Administrador", "Todas"]
-                conn.update(worksheet=nombre, data=df_init)
+            except Exception as e:
+                # Si no existe (o error de permisos), intentamos crearla
+                if "Worksheet not found" in str(e) or "404" in str(e):
+                    try:
+                        df_init = pd.DataFrame(columns=cols)
+                        if nombre == "usuarios":
+                            df_init.loc[0] = ["admin", "admin123", "Administrador", "Todas"]
+                        conn.update(worksheet=nombre, data=df_init)
+                    except Exception as e2:
+                        st.error(f"❌ No se pudo crear la pestaña '{nombre}': {e2}")
+                        raise e2
+                else:
+                    st.error(f"❌ Error al verificar pestaña '{nombre}': {e}")
+                    raise e
 
 # Ejecutar inicialización al arranque
 try:
@@ -221,7 +233,7 @@ except Exception as e:
         elif "UnsupportedOperationError" in err_str:
             st.error("🔒 Conexión de Solo Lectura: Has configurado el Spreadsheet pero no los permisos de escritura (Service Account).")
         else:
-            st.warning(f"⚠️ Nota: Problema al conectar Google Sheets. Detalles: {err_str}")
+            st.warning(f"⚠️ Nota: Problema al conectar Google Sheets. Detalles: {err_str if err_str else 'Error desconocido (posiblemente falta habilitar Google Drive API)'}")
     else:
         st.error(f"Error al inicializar base de datos: {e}")
 
@@ -264,19 +276,48 @@ if not st.session_state.login:
             if conn:
                 st.success("✅ Conexión con Google establecida")
                 try:
-                    # Intentar ver qué pestañas existen
-                    tablas_cloud = ["usuarios", "vehiculos", "viajes", "stock_playa", "personal", "gastos"]
-                    encontradas = []
-                    for t in tablas_cloud:
-                        try:
-                            conn.read(worksheet=t, ttl=0)
-                            encontradas.append(t)
-                        except: pass
-                    st.write(f"**Pestañas encontradas:** {', '.join(encontradas) if encontradas else 'Ninguna (Asegúrate de que existan o que el permiso de Editor esté bien puesto)'}")
+                    # Mostrar URL y Project ID para verificar
+                    secret_gs = st.secrets["connections"]["gsheets"]
+                    url_sheet = secret_gs.get("spreadsheet", "No configurada")
+                    proj_id = secret_gs.get("project_id", "No configurado")
+                    
+                    st.write(f"**URL configurada:** `{url_sheet[:40]}...`")
+                    st.write(f"**Proyecto Google:** `{proj_id}`")
+                    st.info("💡 Asegúrate de que en la parte de arriba de tu Google Cloud aparezca este mismo nombre de proyecto.")
+                    
+                    # Intentar ver qué pestañas existen REALMENTE en el archivo
+                    try:
+                        # gsheets_connection no expone directamente el cliente de gspread, 
+                        # pero podemos intentar deducir las hojas leyendo el metadata si fuera posible.
+                        # Por ahora usaremos la lista que conocemos y reportaremos el error exacto.
+                        tablas_cloud = ["usuarios", "vehiculos", "viajes", "stock_playa", "personal", "gastos"]
+                        encontradas = []
+                        detalles_errores = []
+                        for t in tablas_cloud:
+                            try:
+                                # Usamos ttl=0 para forzar lectura fresca
+                                tmp_df = conn.read(worksheet=t, ttl=0)
+                                encontradas.append(t)
+                            except Exception as ex: 
+                                msg = str(ex)
+                                if "Worksheet not found" not in msg:
+                                    detalles_errores.append(f"**{t}**: {msg}")
+                        
+                        st.write(f"**Pestañas detectadas:** {', '.join(encontradas) if encontradas else 'NINGUNA'}")
+                        
+                        if detalles_errores:
+                            with st.expander("🔍 Ver detalles técnicos de los errores"):
+                                for d in detalles_errores: st.write(d)
+                        
+                        if not encontradas:
+                            st.error("🚨 La app no encuentra las hojas en tu Excel.")
+                            st.info("Esto suele pasar por 2 motivos:\n1. Falta habilitar la **Google Drive API** (no solo la de Sheets).\n2. El Excel está vacío (solo tiene 'Hoja 1').")
+                    except Exception as e:
+                        st.error(f"Error al analizar el Excel: {e}")
                 except Exception as e:
-                    st.error(f"Error al leer pestañas: {e}")
+                    st.error(f"Error en diagnóstico: {e}")
             else:
-                st.error("❌ No se pudo conectar con Google Sheets. Revisa los 'Secrets' en Streamlit Cloud.")
+                st.error("❌ No se pudo conectar con Google Sheets. Revisa los 'Secrets'.")
 else:
     with st.sidebar:
         st.title("SERVICIOS DE LOGÍSTICA")
