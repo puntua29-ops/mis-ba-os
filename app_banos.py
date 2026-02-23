@@ -172,6 +172,8 @@ def init_db():
     else:
         # Inicialización en Google Sheets
         conn = get_db_connection()
+        if not conn: return
+        
         tablas = {
             "usuarios": ["user", "password", "rol", "sucursal"],
             "vehiculos": ["patente", "modelo", "sucursal"],
@@ -528,7 +530,5 @@ else:
                 if u_del and u_del != "admin":
                     run_query("DELETE FROM usuarios WHERE user=?", (u_del,), commit=True)
                     st.success(f"Usuario {u_del} eliminado."); time.sleep(1); st.rerun()
-
-
 
 
