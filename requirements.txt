@@ -1,6 +1,8 @@
 streamlit
 pandas
 geopy
+folium
+streamlit-folium
 openpyxl
 xlsxwriter
 st-gsheets-connection
