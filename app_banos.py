@@ -2,13 +2,13 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import datetime
-import io
 import folium
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
-from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 import time
 import os
+import hashlib
+import threading
 
 try:
     from streamlit_gsheets import GSheetsConnection
@@ -18,335 +18,318 @@ except Exception as e:
     HAS_GSHEETS = False
     GSHEETS_ERR = str(e)
 
-# --- CONFIGURACIÓN ESTÉTICA ---
+# ─────────────────────────────────────────────
+# CONFIGURACIÓN ESTÉTICA
+# ─────────────────────────────────────────────
 st.set_page_config(page_title="Servicios de Logística", layout="wide")
-
 st.markdown("""
     <style>
     .stApp { background-color: #F5F5DC; }
     h1, h2, h3, p, label { color: #000000 !important; }
-    div.stButton > button { 
-        background-color: #8DB600; color: black; font-weight: bold; border: 2px solid black; 
+    div.stButton > button {
+        background-color: #8DB600; color: black; font-weight: bold; border: 2px solid black;
     }
     </style>
-    """, unsafe_allow_html=True)
+""", unsafe_allow_html=True)
 
-# --- BASE DE DATOS UNIFICADA CON CACHÉ ---
-# --- BASE DE DATOS UNIFICADA (SQLite Local o GSheets Cloud) ---
-IS_CLOUD = 'STREAMLIT_RUNTIME_ENV' in os.environ or os.path.exists('.streamlit/secrets.toml')
+IS_CLOUD = 'STREAMLIT_RUNTIME_ENV' in os.environ
+DB_PATH  = 'gestion_banos.db'
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+# ─────────────────────────────────────────────
+# CAPA DE BASE DE DATOS
+# El lock Y la conexión se cachean juntos con
+# @st.cache_resource para que sean ÚNICOS en
+# todo el proceso, independientemente de cuántas
+# veces Streamlit rerenderice el script.
+# ─────────────────────────────────────────────
 
 @st.cache_resource
-def get_db_connection():
-    if not IS_CLOUD:
-        return sqlite3.connect('gestion_banos.db', check_same_thread=False, timeout=30)
-    else:
-        if not HAS_GSHEETS:
-            st.error(f"❌ Error de Librería: {GSHEETS_ERR}")
-            st.info("Para solucionar esto en la Nube, asegúrate de que 'st-gsheets-connection' esté en el archivo 'requirements.txt'.")
-            return None
-        # En la nube usamos st.connection para Google Sheets
-        try:
-            return st.connection("gsheets", type=GSheetsConnection)
-        except Exception:
-            st.error("⚠️ No se encontró la configuración de Google Sheets en Secrets.")
-            return None
+def _get_sqlite_resources():
+    """Devuelve (conn, lock) cacheados: solo se crean UNA vez por proceso."""
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=60)
+    conn.execute("PRAGMA journal_mode=WAL")   # permite lecturas concurrentes
+    conn.execute("PRAGMA synchronous=NORMAL") # balance rendimiento/seguridad
+    conn.commit()
+    lock = threading.Lock()
+    return conn, lock
+
+@st.cache_resource
+def get_gsheets_connection():
+    if not HAS_GSHEETS:
+        st.error(f"❌ Error de Librería GSheets: {GSHEETS_ERR}")
+        return None
+    try:
+        return st.connection("gsheets", type=GSheetsConnection)
+    except Exception:
+        st.error("⚠️ No se encontró la configuración de Google Sheets en Secrets.")
+        return None
 
 def run_query(query, params=(), commit=False):
+    """Ejecuta una query SQLite (local) o GSheets (cloud) de forma segura."""
     if not IS_CLOUD:
-        conn = get_db_connection()
-        c = conn.cursor()
-        for _ in range(5):
+        conn, lock = _get_sqlite_resources()
+        with lock:
             try:
+                c = conn.cursor()
                 c.execute(query, params)
                 if commit:
                     conn.commit()
                     return True
                 return c.fetchall()
-            except sqlite3.OperationalError as e:
-                if "locked" in str(e): time.sleep(0.5)
-                else: raise e
-        raise sqlite3.OperationalError("Database is locked")
+            except sqlite3.IntegrityError:
+                raise   # relanzar para que el llamador lo capture
+            except Exception as e:
+                conn.rollback()
+                raise e
     else:
-        # LOGICA PARA GOOGLE SHEETS (Modo simplificado usando st.connection)
-        conn = get_db_connection()
-        if not conn: return []
+        # ── MODO GOOGLE SHEETS ──────────────────────────────────────
+        gconn = get_gsheets_connection()
+        if not gconn:
+            return []
 
         q_lower = query.lower()
-        tablas = ["usuarios", "vehiculos", "viajes", "stock_playa", "personal", "gastos"]
+        tablas  = ["usuarios", "vehiculos", "viajes", "stock_playa", "personal", "gastos"]
         tabla_target = next((t for t in tablas if t in q_lower), None)
-        
         if not tabla_target:
             return []
 
         try:
-            df = conn.read(worksheet=tabla_target, ttl=0)
-            if df is None or df.empty: 
-                # Si llega aquí, es que existe pero no tiene datos
+            df = gconn.read(worksheet=tabla_target, ttl=0)
+            if df is None or df.empty:
                 return []
-            
+
             if "select" in q_lower:
                 df_res = df.copy()
-                # Filtrado simple
                 if "where" in q_lower and params:
-                    if tabla_target == "usuarios" and "user=?" in q_lower.replace(" ",""):
-                        df_res = df_res[(df_res['user'] == str(params[0])) & (df_res['password'] == str(params[1]))]
-                    elif "sucursal=?" in q_lower.replace(" ",""):
+                    if tabla_target == "usuarios" and "user=?" in q_lower.replace(" ", ""):
+                        df_res = df_res[
+                            (df_res['user'] == str(params[0])) &
+                            (df_res['password'] == str(params[1]))
+                        ]
+                    elif "sucursal=?" in q_lower.replace(" ", ""):
                         df_res = df_res[df_res['sucursal'] == params[0]]
-                    elif "estado=?" in q_lower.replace(" ",""):
+                    elif "estado=?" in q_lower.replace(" ", ""):
                         df_res = df_res[df_res['estado'] == params[0]]
-                
-                # Columnas solicitadas
+
                 cols_str = q_lower.split("select")[1].split("from")[0].strip()
                 if cols_str != "*" and "," in cols_str:
-                    cols_req = [c.strip() for c in cols_str.split(",")]
+                    cols_req  = [c.strip() for c in cols_str.split(",")]
                     valid_cols = [c for c in cols_req if c in df_res.columns]
                     return [tuple(x) for x in df_res[valid_cols].values]
-                
                 return [tuple(x) for x in df_res.values]
 
             if commit:
                 if "insert" in q_lower:
                     if tabla_target in ["viajes", "personal", "gastos"]:
-                        next_id = int(df['id'].max() + 1) if not df.empty and 'id' in df.columns else 1
-                        params = (next_id,) + params
-                    
+                        next_id = int(df['id'].max() + 1) if 'id' in df.columns else 1
+                        params  = (next_id,) + params
                     if len(params) == len(df.columns):
                         new_row = pd.DataFrame([params], columns=df.columns)
                         df = pd.concat([df, new_row], ignore_index=True)
                     else:
-                        st.error(f"Error: Columnas no coinciden en {tabla_target}")
+                        st.error(f"Error: columnas no coinciden en {tabla_target}")
                         return False
                 elif "update" in q_lower:
                     if "stock_playa" in q_lower:
                         df.loc[df['nro_unit'] == params[1], 'estado'] = params[0]
                     elif "viajes" in q_lower:
-                        df.loc[df['id'] == int(params[4]), ['cliente', 'destino', 'precio_unit', 'total']] = params[:4]
+                        df.loc[df['id'] == int(params[4]),
+                               ['cliente','destino','precio_unit','total']] = params[:4]
                 elif "delete" in q_lower:
                     if "stock_playa" in q_lower:
                         df = df[df['nro_unit'] != params[0]]
                     elif "usuarios" in q_lower:
                         df = df[df['user'] != params[0]]
-                
+
                 try:
-                    conn.update(worksheet=tabla_target, data=df)
+                    gconn.update(worksheet=tabla_target, data=df)
                 except Exception as e:
-                    if "UnsupportedOperationError" in str(type(e).__name__):
-                        st.error("🔒 Error de Escritura: La conexión actual es de 'Solo Lectura'. Para guardar datos en la nube necesitas configurar una 'Service Account' en los Secrets de Streamlit.")
+                    if "UnsupportedOperationError" in type(e).__name__:
+                        st.error("🔒 Conexión de Solo Lectura. Configurá una Service Account en Streamlit Secrets.")
                     else:
                         st.error(f"Error al guardar en GSheets: {e}")
                     return False
                 return True
+
         except Exception as e:
             err_msg = str(e)
             if "Worksheet not found" in err_msg:
                 return []
-            if "Worksheet not found" in err_msg:
-                return []
-            if "PERMISSION_DENIED" in err_msg or "403" in err_msg or "PermissionError" in type(e).__name__:
-                st.error(f"🚫 **Error de Permisos en Google Sheets**")
-                st.info(f"Para solucionar esto, comparte tu Excel con este correo (como **Editor**):")
+            if "PERMISSION_DENIED" in err_msg or "403" in err_msg:
+                st.error("🚫 **Error de Permisos en Google Sheets**")
                 st.code("servicio-app-logistica@simba-agent.iam.gserviceaccount.com")
-                st.markdown("👉 [Abrir mi Excel para compartir](https://docs.google.com/spreadsheets/d/1gBCViKkKxdVZS7XP_uv3xVW3UHqr8VUcaOJ2xCuuP3E/)")
             else:
                 st.error(f"❌ Error en GSheets ({tabla_target}): {err_msg}")
             return []
 
-# Inicialización de Tablas
-# Inicialización de Tablas
-def init_db():
-    if not IS_CLOUD:
-        conn = get_db_connection()
+# ─────────────────────────────────────────────
+# INICIALIZACIÓN DE TABLAS
+# También usa el recurso cacheado para evitar
+# conflictos durante el arranque.
+# ─────────────────────────────────────────────
+
+@st.cache_resource
+def _init_db_once():
+    """Crea las tablas y el usuario admin UNA sola vez por proceso."""
+    if IS_CLOUD:
+        return  # La inicialización cloud se maneja en init_db_cloud()
+
+    conn, lock = _get_sqlite_resources()
+    with lock:
         c = conn.cursor()
-        tablas_cols = {
-            "usuarios": ["user", "password", "rol", "sucursal"],
-            "vehiculos": ["patente", "modelo", "sucursal"],
-            "viajes": ["id", "fecha", "cliente", "patente", "destino", "tipo_mov", "unidades", "cantidad", "tipo_contrato", "km_entrega", "precio_unit", "total", "estado_pago", "lat", "lon", "sucursal"],
-            "stock_playa": ["nro_unit", "tipo", "modelo", "estado", "sucursal"],
-            "personal": ["id", "fecha", "nombre", "tarea", "pago", "sucursal"],
-            "gastos": ["id", "fecha", "patente", "concepto", "monto", "sucursal"]
-        }
-        
-        # Crear tablas si no existen
-        c.execute('CREATE TABLE IF NOT EXISTS usuarios (user TEXT PRIMARY KEY, password TEXT, rol TEXT, sucursal TEXT)')
-        c.execute('CREATE TABLE IF NOT EXISTS vehiculos (patente TEXT PRIMARY KEY, modelo TEXT, sucursal TEXT)')
-        c.execute('''CREATE TABLE IF NOT EXISTS viajes 
-                     (id INTEGER PRIMARY KEY, fecha TEXT, cliente TEXT, patente TEXT, 
-                      destino TEXT, tipo_mov TEXT, unidades TEXT, cantidad INTEGER, 
-                      tipo_contrato TEXT, km_entrega REAL, precio_unit REAL, total REAL, 
-                      estado_pago TEXT, lat REAL, lon REAL, sucursal TEXT)''')
-        c.execute('CREATE TABLE IF NOT EXISTS stock_playa (nro_unit TEXT PRIMARY KEY, tipo TEXT, modelo TEXT, estado TEXT, sucursal TEXT)')
-        c.execute('CREATE TABLE IF NOT EXISTS personal (id INTEGER PRIMARY KEY, fecha TEXT, nombre TEXT, tarea TEXT, pago REAL, sucursal TEXT)')
-        c.execute('CREATE TABLE IF NOT EXISTS gastos (id INTEGER PRIMARY KEY, fecha TEXT, patente TEXT, concepto TEXT, monto REAL, sucursal TEXT)')
-        
-        # MIGRACIÓN: Agregar columna sucursal si falta en cada tabla
-        for tabla, cols in tablas_cols.items():
+        # Crear tablas
+        c.execute("""CREATE TABLE IF NOT EXISTS usuarios
+                     (user TEXT PRIMARY KEY, password TEXT, rol TEXT, sucursal TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS vehiculos
+                     (patente TEXT PRIMARY KEY, modelo TEXT, sucursal TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS viajes
+                     (id INTEGER PRIMARY KEY, fecha TEXT, cliente TEXT, patente TEXT,
+                      destino TEXT, tipo_mov TEXT, unidades TEXT, cantidad INTEGER,
+                      tipo_contrato TEXT, km_entrega REAL, precio_unit REAL, total REAL,
+                      estado_pago TEXT, lat REAL, lon REAL, sucursal TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS stock_playa
+                     (nro_unit TEXT PRIMARY KEY, tipo TEXT, modelo TEXT, estado TEXT, sucursal TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS personal
+                     (id INTEGER PRIMARY KEY, fecha TEXT, nombre TEXT, tarea TEXT, pago REAL, sucursal TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS gastos
+                     (id INTEGER PRIMARY KEY, fecha TEXT, patente TEXT, concepto TEXT, monto REAL, sucursal TEXT)""")
+
+        # Migración: agregar columna sucursal si falta en alguna tabla
+        for tabla in ["usuarios","vehiculos","viajes","stock_playa","personal","gastos"]:
             try:
                 c.execute(f"PRAGMA table_info({tabla})")
                 cols_actuales = [row[1] for row in c.fetchall()]
                 if "sucursal" not in cols_actuales:
                     c.execute(f"ALTER TABLE {tabla} ADD COLUMN sucursal TEXT DEFAULT 'Sucursal A'")
-                    conn.commit()
-            except Exception: pass
-        
+            except Exception:
+                pass
+
+        conn.commit()
+
+        # Insertar usuario administrador si no existe
         try:
-            c.execute("INSERT INTO usuarios VALUES ('admin', 'admin123', 'Administrador', 'Todas')")
+            c.execute(
+                "INSERT INTO usuarios VALUES (?, ?, 'Administrador', 'Todas')",
+                ('marcelo', hash_password('@Lex2110'))
+            )
             conn.commit()
-        except sqlite3.IntegrityError: pass
-    else:
-        # Inicialización en Google Sheets
-        conn = get_db_connection()
-        if not conn: return
-        
-        tablas = {
-            "usuarios": ["user", "password", "rol", "sucursal"],
-            "vehiculos": ["patente", "modelo", "sucursal"],
-            "viajes": ["id", "fecha", "cliente", "patente", "destino", "tipo_mov", "unidades", "cantidad", "tipo_contrato", "km_entrega", "precio_unit", "total", "estado_pago", "lat", "lon", "sucursal"],
-            "stock_playa": ["nro_unit", "tipo", "modelo", "estado", "sucursal"],
-            "personal": ["id", "fecha", "nombre", "tarea", "pago", "sucursal"],
-            "gastos": ["id", "fecha", "patente", "concepto", "monto", "sucursal"]
-        }
-        for nombre, cols in tablas.items():
-            try:
-                # Intentar leer para ver si existe
-                df_actual = conn.read(worksheet=nombre, ttl=0)
-                # MIGRACIÓN: Si faltan columnas (como 'sucursal'), las agregamos
-                missing = [c for c in cols if c not in df_actual.columns]
-                if missing:
-                    for c in missing:
-                        df_actual[c] = "Todas" if nombre == "usuarios" else "Sucursal A"
-                    conn.update(worksheet=nombre, data=df_actual)
-            except Exception as e:
-                # Si no existe (o error de permisos), intentamos crearla
-                if "Worksheet not found" in str(e) or "404" in str(e):
-                    try:
-                        df_init = pd.DataFrame(columns=cols)
-                        if nombre == "usuarios":
-                            df_init.loc[0] = ["admin", "admin123", "Administrador", "Todas"]
-                        conn.update(worksheet=nombre, data=df_init)
-                    except Exception as e2:
-                        st.error(f"❌ No se pudo crear la pestaña '{nombre}': {e2}")
-                        raise e2
-                else:
-                    st.error(f"❌ Error al verificar pestaña '{nombre}': [{type(e).__name__}] {e}")
-                    raise e
+        except sqlite3.IntegrityError:
+            pass  # Ya existe, no hay problema
 
-# Ejecutar inicialización al arranque
+    return True
+
+def init_db_cloud():
+    """Inicialización para Google Sheets (cloud)."""
+    gconn = get_gsheets_connection()
+    if not gconn:
+        return
+    tablas = {
+        "usuarios":   ["user","password","rol","sucursal"],
+        "vehiculos":  ["patente","modelo","sucursal"],
+        "viajes":     ["id","fecha","cliente","patente","destino","tipo_mov","unidades",
+                       "cantidad","tipo_contrato","km_entrega","precio_unit","total",
+                       "estado_pago","lat","lon","sucursal"],
+        "stock_playa":["nro_unit","tipo","modelo","estado","sucursal"],
+        "personal":   ["id","fecha","nombre","tarea","pago","sucursal"],
+        "gastos":     ["id","fecha","patente","concepto","monto","sucursal"]
+    }
+    for nombre, cols in tablas.items():
+        try:
+            df_actual = gconn.read(worksheet=nombre, ttl=0)
+            missing = [c for c in cols if c not in df_actual.columns]
+            if missing:
+                for col in missing:
+                    df_actual[col] = "Todas" if nombre == "usuarios" else "Sucursal A"
+                gconn.update(worksheet=nombre, data=df_actual)
+        except Exception as e:
+            if "Worksheet not found" in str(e) or "404" in str(e):
+                try:
+                    df_init = pd.DataFrame(columns=cols)
+                    if nombre == "usuarios":
+                        df_init.loc[0] = ["marcelo", hash_password("@Lex2110"), "Administrador", "Todas"]
+                    gconn.update(worksheet=nombre, data=df_init)
+                except Exception as e2:
+                    st.error(f"❌ No se pudo crear la pestaña '{nombre}': {e2}")
+            else:
+                st.error(f"❌ Error al verificar pestaña '{nombre}': {e}")
+
+# ── Ejecutar inicialización ──────────────────
 try:
-    init_db()
-except Exception as e:
     if IS_CLOUD:
-        err_str = str(e)
-        if "403" in err_str or "PERMISSION_DENIED" in err_str:
-            st.error("🔒 Error de Acceso: No tienes permisos de escritura en el Google Sheets. Por favor, comparte el Excel con el email de la 'Service Account' dándole permiso de EDITOR.")
-        elif "UnsupportedOperationError" in err_str:
-            st.error("🔒 Conexión de Solo Lectura: Has configurado el Spreadsheet pero no los permisos de escritura (Service Account).")
-        else:
-            st.warning(f"⚠️ Nota: Problema al conectar Google Sheets. Detalles: {err_str if err_str else 'Error desconocido (posiblemente falta habilitar Google Drive API)'}")
+        init_db_cloud()
     else:
-        st.error(f"Error al inicializar base de datos: {e}")
-        if "drive.googleapis.com" in str(e).lower():
-            st.error("🚨 **API de Google Drive Deshabilitada**")
-            st.markdown("""
-            Para solucionar esto, haz clic en el siguiente enlace y presiona el botón **HABILITAR**: 
-            👉 [Habilitar Google Drive API](https://console.developers.google.com/apis/api/drive.googleapis.com/overview?project=827997471611)
-            """)
+        _init_db_once()  # cached: corre solo una vez
+except Exception as e:
+    err_str = str(e)
+    if IS_CLOUD:
+        if "403" in err_str or "PERMISSION_DENIED" in err_str:
+            st.error("🔒 Sin permisos de escritura en Google Sheets.")
+        else:
+            st.warning(f"⚠️ Problema al conectar Google Sheets: {err_str}")
+    else:
+        st.error(f"Error al inicializar base de datos: {err_str}")
 
-# --- CONFIGURACIÓN DE GPS ---
-geolocator = Nominatim(user_agent="servicios_logistica_v1_fix")
+# ─────────────────────────────────────────────
+# GPS
+# ─────────────────────────────────────────────
+geolocator = Nominatim(user_agent="servicios_logistica_v2")
 
-# --- LOGIN ---
+# ─────────────────────────────────────────────
+# LOGIN
+# ─────────────────────────────────────────────
 if 'login' not in st.session_state:
     st.session_state.login = False
 
 if not st.session_state.login:
     st.markdown("<h1 style='text-align: center;'>🚚 SERVICIOS DE LOGÍSTICA</h1>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns([1,1,1])
+    _, c2, _ = st.columns([1, 1, 1])
     with c2:
         u = st.text_input("Usuario")
         p = st.text_input("Contraseña", type="password")
         if st.button("INGRESAR", use_container_width=True):
             with st.spinner("Verificando..."):
-                res = run_query("SELECT rol, sucursal FROM usuarios WHERE user=? AND password=?", (u, p))
+                res = run_query(
+                    "SELECT rol, sucursal FROM usuarios WHERE user=? AND password=?",
+                    (u, hash_password(p))
+                )
                 if res:
-                    st.session_state.login = True
-                    st.session_state.rol = res[0][0]
+                    st.session_state.login    = True
+                    st.session_state.rol      = res[0][0]
                     st.session_state.sucursal = res[0][1]
-                    st.session_state.user = u
+                    st.session_state.user     = u
                     st.rerun()
-                else: 
-                    # Verificar si es por usuario inexistente o error de conexión
-                    check_user = run_query("SELECT user FROM usuarios")
-                    if not check_user:
-                        st.error("🚫 Error: No se encontraron usuarios en la base de datos. Es posible que el Service Account no tenga permisos de escritura para crear el usuario 'admin' inicial.")
+                else:
+                    todos = run_query("SELECT user FROM usuarios")
+                    if not todos:
+                        st.error("🚫 No hay usuarios en la base de datos.")
                     else:
                         st.error("❌ Usuario o contraseña incorrectos")
 
-    # --- SECCIÓN DE DIAGNÓSTICO (Solo visible si hay problemas) ---
-    with st.expander("🛠️ Diagnóstico de Conexión (Click aquí si nada funciona)"):
+    with st.expander("🛠️ Diagnóstico de Conexión"):
         st.write(f"**Entorno:** {'Nube (Cloud)' if IS_CLOUD else 'Local (PC)'}")
         st.write(f"**Librería GSheets:** {'✅ Instalada' if HAS_GSHEETS else '❌ No encontrada'}")
+        if not IS_CLOUD:
+            st.write(f"**Archivo DB:** `{os.path.abspath(DB_PATH)}`")
+            st.write(f"**Existe:** {'✅ Sí' if os.path.exists(DB_PATH) else '❌ No'}")
         if IS_CLOUD:
-            conn = get_db_connection()
-            if conn:
-                st.success("✅ Conexión con Google establecida")
-                try:
-                    # Mostrar URL y Project ID para verificar
-                    secret_gs = st.secrets["connections"]["gsheets"]
-                    url_sheet = secret_gs.get("spreadsheet", "No configurada")
-                    proj_id = secret_gs.get("project_id", "No configurado")
-                    
-                    st.write(f"**URL configurada:** `{url_sheet[:40]}...`")
-                    st.write(f"**Proyecto Google:** `{proj_id}`")
-                    st.info("💡 Asegúrate de que en la parte de arriba de tu Google Cloud aparezca este mismo nombre de proyecto.")
-                    
-                    # Intentar ver qué pestañas existen REALMENTE en el archivo
-                    try:
-                        # gsheets_connection no expone directamente el cliente de gspread, 
-                        # pero podemos intentar deducir las hojas leyendo el metadata si fuera posible.
-                        # Por ahora usaremos la lista que conocemos y reportaremos el error exacto.
-                        tablas_cloud = ["usuarios", "vehiculos", "viajes", "stock_playa", "personal", "gastos"]
-                        encontradas = []
-                        detalles_errores = []
-                        for t in tablas_cloud:
-                            try:
-                                # Usamos ttl=0 para forzar lectura fresca
-                                tmp_df = conn.read(worksheet=t, ttl=0)
-                                encontradas.append(t)
-                            except Exception as ex: 
-                                msg = str(ex)
-                                if "Worksheet not found" not in msg:
-                                    detalles_errores.append(f"**{t}**: {msg}")
-                        
-                        st.write(f"**Pestañas detectadas:** {', '.join(encontradas) if encontradas else 'NINGUNA'}")
-                        if detalles_errores:
-                            with st.expander("🔍 Ver detalles técnicos de los errores"):
-                                for d in detalles_errores: st.write(d)
-                        
-                        st.error("🚨 La app no encuentra las hojas en tu Excel.")
-                        st.markdown(f"""
-### 🛠️ Pasos para solucionar el problema:
-
-1. **Seleccionar Proyecto**: Arriba de todo en Google Cloud, asegúrate de haber seleccionado el proyecto: 
-   👉 **`{proj_id}`**
-2. **Habilitar API**: Ve a [este buscador](https://console.cloud.google.com/apis/library) y escribe **Google Drive API**.
-3. **Pestaña Excel**: Verifica que tu Excel tenga la pestaña llamada **`usuarios`** abajo.
-""")
-                        if detalles_errores:
-                            with st.expander("🔍 Ver detalles técnicos de los errores"):
-                                for d in detalles_errores: st.write(d)
-                    except Exception as e:
-                        st.error(f"Error al analizar el Excel: [{type(e).__name__}] {e}")
-                except Exception as e:
-                    st.error(f"Error en diagnóstico: {e}")
+            gconn = get_gsheets_connection()
+            if gconn:
+                st.success("✅ Conexión con Google Sheets establecida")
             else:
-                st.error("❌ No se pudo conectar con Google Sheets. Revisa los 'Secrets'.")
+                st.error("❌ No se pudo conectar con Google Sheets.")
+
 else:
+    # ─────────────────────────────────────────────
+    # SIDEBAR
+    # ─────────────────────────────────────────────
     with st.sidebar:
         st.title("SERVICIOS DE LOGÍSTICA")
         st.write(f"👤 Usuario: {st.session_state.user}")
         st.write(f"🏠 Sucursal: {st.session_state.sucursal}")
-        
-        # Filtro de sucursal para Admin
+
         if st.session_state.rol == "Administrador":
             st.divider()
             st.subheader("Configuración de Vista")
@@ -361,138 +344,155 @@ else:
                 del st.session_state[key]
             st.rerun()
 
-    # Definición de Pestañas
-    st.markdown(f"<h1 style='text-align: center;'>🚚 SERVICIOS DE LOGÍSTICA</h1>", unsafe_allow_html=True)
+    # ─────────────────────────────────────────────
+    # ENCABEZADO Y TABS
+    # ─────────────────────────────────────────────
+    st.markdown("<h1 style='text-align: center;'>🚚 SERVICIOS DE LOGÍSTICA</h1>", unsafe_allow_html=True)
     st.markdown(f"<h3 style='text-align: center; color: #8DB600 !important;'>📍 Gestionando: {st.session_state.suc_ver}</h3>", unsafe_allow_html=True)
-    
+
     titulos = ["📋 CARGAS", "🗺️ MAPA", "📊 HISTORIAL", "👷 PERSONAL", "⛽ GASTOS", "💰 BALANCE"]
     if st.session_state.rol == "Administrador":
         titulos += ["📦 STOCK", "🚛 VEHÍCULOS", "👥 USUARIOS"]
-    
+
     tabs = st.tabs(titulos)
 
-    # --- PESTAÑA 0: CARGAS ---
+    # ─────────────────────────────────────────────
+    # PESTAÑA 0: CARGAS
+    # ─────────────────────────────────────────────
     with tabs[0]:
         st.header("Registro de Movimiento")
-        v_list = [r[0] for r in run_query("SELECT patente FROM vehiculos WHERE sucursal = ?", (st.session_state.suc_ver,))] if st.session_state.suc_ver != "Todas" else [r[0] for r in run_query("SELECT patente FROM vehiculos")]
-        
-        mov = st.radio("Acción", ["Entregado", "Retirado"], horizontal=True)
+
+        if st.session_state.suc_ver != "Todas":
+            v_list = [r[0] for r in run_query("SELECT patente FROM vehiculos WHERE sucursal=?", (st.session_state.suc_ver,))]
+        else:
+            v_list = [r[0] for r in run_query("SELECT patente FROM vehiculos")]
+
+        mov        = st.radio("Acción", ["Entregado", "Retirado"], horizontal=True)
         est_buscar = "En Playa" if mov == "Entregado" else "En Calle"
-        
-        # Filtrar unidades disponibles por sucursal
-        q_units = "SELECT nro_unit FROM stock_playa WHERE estado=? AND sucursal=?"
-        p_units = (est_buscar, st.session_state.suc_ver)
+
         if st.session_state.suc_ver == "Todas":
-            q_units = "SELECT nro_unit FROM stock_playa WHERE estado=?"
-            p_units = (est_buscar,)
-            
-        try:
-            u_dispo = [r[0] for r in run_query(q_units, p_units)]
-        except Exception:
-            u_dispo = []
-            
+            u_dispo = [r[0] for r in run_query("SELECT nro_unit FROM stock_playa WHERE estado=?", (est_buscar,))]
+        else:
+            u_dispo = [r[0] for r in run_query("SELECT nro_unit FROM stock_playa WHERE estado=? AND sucursal=?", (est_buscar, st.session_state.suc_ver))]
+
         with st.form("form_viajes"):
             c1, c2 = st.columns(2)
             with c1:
-                f_cli = st.text_input("Cliente / Obra")
-                f_dest = st.text_input("Dirección de Entrega")
+                f_cli    = st.text_input("Cliente / Obra")
+                f_dest   = st.text_input("Dirección de Entrega")
                 f_tipo_c = st.selectbox("Contrato", ["Mensual (Obra)", "Eventual (Evento)"])
-                f_km = st.number_input("Km", min_value=0.0)
+                f_km     = st.number_input("Km", min_value=0.0)
             with c2:
                 f_units = st.multiselect("Nº Unidades", u_dispo)
-                f_pat = st.selectbox("Vehículo", v_list if v_list else ["Sin Patente"])
-                f_prec = st.number_input("Precio Unitario ($)", min_value=0.0)
-                f_pago = st.selectbox("Estado Pago", ["Pendiente", "Pagado"])
-            
+                f_pat   = st.selectbox("Vehículo", v_list if v_list else ["Sin Patente"])
+                f_prec  = st.number_input("Precio Unitario ($)", min_value=0.0)
+                f_pago  = st.selectbox("Estado Pago", ["Pendiente", "Pagado"])
+
             if st.form_submit_button("GUARDAR"):
                 if f_units and (f_cli or mov == "Retirado"):
                     lat, lon = None, None
                     if mov == "Entregado":
                         try:
-                            busqueda = f"{f_dest}, Cordoba, Argentina"
-                            location = geolocator.geocode(busqueda, timeout=5)
-                            if location: lat, lon = location.latitude, location.longitude
-                        except Exception: pass
+                            location = geolocator.geocode(f"{f_dest}, Cordoba, Argentina", timeout=5)
+                            if location:
+                                lat, lon = location.latitude, location.longitude
+                        except Exception:
+                            pass
 
                     fecha_h = datetime.now().strftime("%d/%m/%Y %H:%M")
-                    str_u = ", ".join(f_units)
+                    str_u   = ", ".join(f_units)
                     total_v = len(f_units) * f_prec
                     nuevo_e = "En Calle" if mov == "Entregado" else "En Playa"
-                    
-                    run_query("""INSERT INTO viajes (fecha, cliente, patente, destino, tipo_mov, 
-                                 unidades, cantidad, tipo_contrato, km_entrega, precio_unit, total, estado_pago, lat, lon, sucursal) 
-                                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                               (fecha_h, f_cli, f_pat, f_dest, mov, str_u, len(f_units), f_tipo_c, f_km, f_prec, total_v, f_pago, lat, lon, st.session_state.sucursal), commit=True)
-                    
-                    for unit in f_units:
-                        run_query("UPDATE stock_playa SET estado = ? WHERE nro_unit = ?", (nuevo_e, unit), commit=True)
-                    
-                    st.success("✅ Guardado correctamente.")
-                    time.sleep(1); st.rerun()
 
-    # --- PESTAÑA 1: MAPA ---
+                    run_query(
+                        """INSERT INTO viajes (fecha, cliente, patente, destino, tipo_mov,
+                           unidades, cantidad, tipo_contrato, km_entrega, precio_unit, total,
+                           estado_pago, lat, lon, sucursal) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (fecha_h, f_cli, f_pat, f_dest, mov, str_u, len(f_units),
+                         f_tipo_c, f_km, f_prec, total_v, f_pago, lat, lon, st.session_state.sucursal),
+                        commit=True
+                    )
+                    for unit in f_units:
+                        run_query("UPDATE stock_playa SET estado=? WHERE nro_unit=?", (nuevo_e, unit), commit=True)
+
+                    st.success("✅ Guardado correctamente.")
+                    time.sleep(1)
+                    st.rerun()
+
+    # ─────────────────────────────────────────────
+    # PESTAÑA 1: MAPA
+    # ─────────────────────────────────────────────
     with tabs[1]:
         st.header("Ubicación de Unidades")
-        q_mapa = "SELECT cliente, destino, unidades, lat, lon FROM viajes WHERE tipo_mov = 'Entregado' AND lat IS NOT NULL"
-        q_calle = "SELECT nro_unit FROM stock_playa WHERE estado='En Calle'"
-        
+
         if st.session_state.suc_ver != "Todas":
-            q_mapa += f" AND sucursal='{st.session_state.suc_ver}'"
-            q_calle += f" AND sucursal='{st.session_state.suc_ver}'"
-            
-        conn = get_db_connection()
-        try:
-            df_mapa = pd.read_sql_query(q_mapa, conn) if not IS_CLOUD else pd.DataFrame(run_query(q_mapa)) # Simplificado
-            if IS_CLOUD: df_mapa.columns = ["cliente", "destino", "unidades", "lat", "lon"]
-            unidades_en_calle = set([r[0] for r in run_query(q_calle)])
-        except:
-            df_mapa, unidades_en_calle = pd.DataFrame(), set()
-        
+            rows_mapa = run_query(
+                "SELECT cliente, destino, unidades, lat, lon FROM viajes WHERE tipo_mov='Entregado' AND lat IS NOT NULL AND sucursal=?",
+                (st.session_state.suc_ver,)
+            )
+            rows_calle = run_query("SELECT nro_unit FROM stock_playa WHERE estado='En Calle' AND sucursal=?", (st.session_state.suc_ver,))
+        else:
+            rows_mapa  = run_query("SELECT cliente, destino, unidades, lat, lon FROM viajes WHERE tipo_mov='Entregado' AND lat IS NOT NULL")
+            rows_calle = run_query("SELECT nro_unit FROM stock_playa WHERE estado='En Calle'")
+
+        df_mapa = pd.DataFrame(rows_mapa, columns=["cliente","destino","unidades","lat","lon"]) if rows_mapa else pd.DataFrame()
+        unidades_en_calle = set(r[0] for r in rows_calle)
+
         if not df_mapa.empty:
             m = folium.Map(location=[-31.4135, -64.1810], zoom_start=11)
             for _, row in df_mapa.iterrows():
                 units_viaje = [u.strip() for u in str(row['unidades']).split(',')]
-                es_activo = any(u in unidades_en_calle for u in units_viaje)
-                folium.Marker([row['lat'], row['lon']], 
-                               popup=f"<b>{row['cliente']}</b><br>{row['unidades']}",
-                               icon=folium.Icon(color='red' if es_activo else 'orange')).add_to(m)
+                es_activo   = any(u in unidades_en_calle for u in units_viaje)
+                folium.Marker(
+                    [row['lat'], row['lon']],
+                    popup=f"<b>{row['cliente']}</b><br>{row['unidades']}",
+                    icon=folium.Icon(color='red' if es_activo else 'orange')
+                ).add_to(m)
             st_folium(m, width=1100, height=500)
         else:
-            st.info("No hay datos para mostrar.")
+            st.info("No hay datos de ubicación para mostrar.")
 
-    # --- PESTAÑA 2: HISTORIAL ---
+    # ─────────────────────────────────────────────
+    # PESTAÑA 2: HISTORIAL
+    # ─────────────────────────────────────────────
     with tabs[2]:
         st.header("Historial")
-        q_hist = "SELECT * FROM viajes"
+
         if st.session_state.suc_ver != "Todas":
-            q_hist += f" WHERE sucursal='{st.session_state.suc_ver}'"
-        q_hist += " ORDER BY id DESC"
-        
-        try:
-            df_h = pd.DataFrame(run_query(q_hist))
-            if not df_h.empty:
-                df_h.columns = ["id", "fecha", "cliente", "patente", "destino", "tipo_mov", "unidades", "cantidad", "tipo_contrato", "km_entrega", "precio_unit", "total", "estado_pago", "lat", "lon", "sucursal"]
-        except:
-            df_h = pd.DataFrame()
-            
+            rows_h = run_query("SELECT * FROM viajes WHERE sucursal=? ORDER BY id DESC", (st.session_state.suc_ver,))
+        else:
+            rows_h = run_query("SELECT * FROM viajes ORDER BY id DESC")
+
+        df_h = pd.DataFrame(rows_h)
+        if not df_h.empty:
+            df_h.columns = ["id","fecha","cliente","patente","destino","tipo_mov","unidades",
+                            "cantidad","tipo_contrato","km_entrega","precio_unit","total",
+                            "estado_pago","lat","lon","sucursal"]
+
         st.dataframe(df_h, use_container_width=True)
         st.write("---")
+
         if not df_h.empty:
             id_editar = st.selectbox("ID a corregir", [""] + df_h['id'].astype(str).tolist())
             if id_editar != "":
                 viaje_sel = df_h[df_h['id'] == int(id_editar)].iloc[0]
                 with st.form("form_edit"):
-                    e_cli = st.text_input("Cliente", value=viaje_sel['cliente'])
+                    e_cli  = st.text_input("Cliente",   value=viaje_sel['cliente'])
                     e_dest = st.text_input("Dirección", value=viaje_sel['destino'])
                     e_prec = st.number_input("Precio ($)", value=float(viaje_sel['precio_unit']))
                     if st.form_submit_button("APLICAR CAMBIOS"):
                         nuevo_total = viaje_sel['cantidad'] * e_prec
-                        run_query("UPDATE viajes SET cliente=?, destino=?, precio_unit=?, total=? WHERE id=?", (e_cli, e_dest, e_prec, nuevo_total, id_editar), commit=True)
+                        run_query(
+                            "UPDATE viajes SET cliente=?, destino=?, precio_unit=?, total=? WHERE id=?",
+                            (e_cli, e_dest, e_prec, nuevo_total, id_editar), commit=True
+                        )
                         st.success("Actualizado")
                         time.sleep(1)
                         st.rerun()
 
-    # --- PESTAÑA 3: PERSONAL ---
+    # ─────────────────────────────────────────────
+    # PESTAÑA 3: PERSONAL
+    # ─────────────────────────────────────────────
     with tabs[3]:
         st.header("👷 Personal")
         with st.form("personal_f"):
@@ -501,91 +501,109 @@ else:
             p_tar = c2.text_input("Tarea")
             p_mon = c3.number_input("Pago ($)", min_value=0.0)
             if st.form_submit_button("REGISTRAR PAGO"):
-                run_query("INSERT INTO personal (fecha, nombre, tarea, pago, sucursal) VALUES (?,?,?,?,?)", 
-                          (datetime.now().strftime("%d/%m/%Y"), p_nom, p_tar, p_mon, st.session_state.sucursal), commit=True)
+                run_query(
+                    "INSERT INTO personal (fecha, nombre, tarea, pago, sucursal) VALUES (?,?,?,?,?)",
+                    (datetime.now().strftime("%d/%m/%Y"), p_nom, p_tar, p_mon, st.session_state.sucursal),
+                    commit=True
+                )
                 st.rerun()
-        
-        q_pers = "SELECT * FROM personal"
+
         if st.session_state.suc_ver != "Todas":
-            q_pers += f" WHERE sucursal='{st.session_state.suc_ver}'"
-        q_pers += " ORDER BY id DESC"
-        
-        df_p = pd.DataFrame(run_query(q_pers))
+            rows_p = run_query("SELECT * FROM personal WHERE sucursal=? ORDER BY id DESC", (st.session_state.suc_ver,))
+        else:
+            rows_p = run_query("SELECT * FROM personal ORDER BY id DESC")
+
+        df_p = pd.DataFrame(rows_p)
         if not df_p.empty:
-            df_p.columns = ["id", "fecha", "nombre", "tarea", "pago", "sucursal"]
+            df_p.columns = ["id","fecha","nombre","tarea","pago","sucursal"]
         st.dataframe(df_p, use_container_width=True)
 
-    # --- PESTAÑA 4: GASTOS ---
+    # ─────────────────────────────────────────────
+    # PESTAÑA 4: GASTOS
+    # ─────────────────────────────────────────────
     with tabs[4]:
         st.header("⛽ Gastos")
-        v_list = [r[0] for r in run_query("SELECT patente FROM vehiculos WHERE sucursal = ?", (st.session_state.sucursal,))]
+        v_list_g = [r[0] for r in run_query("SELECT patente FROM vehiculos WHERE sucursal=?", (st.session_state.sucursal,))]
         with st.form("gastos_f"):
             c1, c2, c3 = st.columns(3)
-            g_pat = c1.selectbox("Vehículo", v_list if v_list else ["S/P"])
+            g_pat = c1.selectbox("Vehículo", v_list_g if v_list_g else ["S/P"])
             g_con = c2.selectbox("Concepto", ["Combustible", "Aceite", "Repuestos", "Limpieza", "Otros"])
             g_mon = c3.number_input("Monto ($)", min_value=0.0)
             if st.form_submit_button("CARGAR GASTO"):
-                run_query("INSERT INTO gastos (fecha, patente, concepto, monto, sucursal) VALUES (?,?,?,?,?)", 
-                          (datetime.now().strftime("%d/%m/%Y"), g_pat, g_con, g_mon, st.session_state.sucursal), commit=True)
+                run_query(
+                    "INSERT INTO gastos (fecha, patente, concepto, monto, sucursal) VALUES (?,?,?,?,?)",
+                    (datetime.now().strftime("%d/%m/%Y"), g_pat, g_con, g_mon, st.session_state.sucursal),
+                    commit=True
+                )
                 st.rerun()
-        
-        q_gast = "SELECT * FROM gastos"
+
         if st.session_state.suc_ver != "Todas":
-            q_gast += f" WHERE sucursal='{st.session_state.suc_ver}'"
-        q_gast += " ORDER BY id DESC"
-        
-        df_g = pd.DataFrame(run_query(q_gast))
+            rows_g = run_query("SELECT * FROM gastos WHERE sucursal=? ORDER BY id DESC", (st.session_state.suc_ver,))
+        else:
+            rows_g = run_query("SELECT * FROM gastos ORDER BY id DESC")
+
+        df_g = pd.DataFrame(rows_g)
         if not df_g.empty:
-            df_g.columns = ["id", "fecha", "patente", "concepto", "monto", "sucursal"]
+            df_g.columns = ["id","fecha","patente","concepto","monto","sucursal"]
         st.dataframe(df_g, use_container_width=True)
 
-    # --- PESTAÑA 5: BALANCE ---
+    # ─────────────────────────────────────────────
+    # PESTAÑA 5: BALANCE
+    # ─────────────────────────────────────────────
     with tabs[5]:
         st.header(f"💰 Balance de Caja - {st.session_state.suc_ver}")
         try:
             cond_suc = st.session_state.suc_ver if st.session_state.suc_ver != "Todas" else None
-            
-            # Obtener datos y filtrar en memoria para mayor compatibilidad
+
             def get_sum(tabla, col_pago):
                 res = run_query(f"SELECT {col_pago}, sucursal FROM {tabla}")
-                if not res: return 0.0
+                if not res:
+                    return 0.0
                 df_temp = pd.DataFrame(res, columns=[col_pago, "sucursal"])
                 if cond_suc:
                     df_temp = df_temp[df_temp["sucursal"] == cond_suc]
                 return pd.to_numeric(df_temp[col_pago], errors='coerce').sum()
 
-            ingresos = get_sum("viajes", "total")
-            egresos_pers = get_sum("personal", "pago")
-            egresos_gastos = get_sum("gastos", "monto")
-            
-            neto = ingresos - (egresos_pers + egresos_gastos)
-            col1, col2, col3, col4 = st.columns(4)
-            col1.metric("Ingresos", f"${ingresos:,.2f}")
-            col2.metric("Personal", f"-${egresos_pers:,.2f}")
-            col3.metric("Gastos", f"-${egresos_gastos:,.2f}")
-            col4.metric("NETO", f"${neto:,.2f}", delta=neto)
-        except Exception as e:
-             st.info(f"Esperando datos para el balance... ({e})")
+            ingresos       = get_sum("viajes",   "total")
+            egresos_pers   = get_sum("personal", "pago")
+            egresos_gastos = get_sum("gastos",   "monto")
+            neto           = ingresos - (egresos_pers + egresos_gastos)
 
-    # --- PESTAÑAS ADMIN ---
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Ingresos",  f"${ingresos:,.2f}")
+            col2.metric("Personal",  f"-${egresos_pers:,.2f}")
+            col3.metric("Gastos",    f"-${egresos_gastos:,.2f}")
+            col4.metric("NETO",      f"${neto:,.2f}", delta=neto)
+        except Exception as e:
+            st.info(f"Esperando datos para el balance... ({e})")
+
+    # ─────────────────────────────────────────────
+    # PESTAÑAS ADMIN
+    # ─────────────────────────────────────────────
     if st.session_state.rol == "Administrador":
-        with tabs[6]: # STOCK
+
+        # STOCK
+        with tabs[6]:
             st.header("📦 Stock")
             c_input, c_view = st.columns([1, 2])
             with c_input:
                 st.subheader("Agregar Unidad")
-                tipo_u = st.selectbox("Tipo", ["Baño Químico", "Contenedor", "Oficina Móvil"])
-                nu = st.text_input("ID Unidad (ej: B01)")
-                mo = st.text_input("Modelo/Marca")
+                tipo_u    = st.selectbox("Tipo", ["Baño Químico", "Contenedor", "Oficina Móvil"])
+                nu        = st.text_input("ID Unidad (ej: B01)")
+                mo        = st.text_input("Modelo/Marca")
                 suc_stock = st.selectbox("Sucursal Asignada", ["Sucursal A", "Sucursal B"])
-                
+
                 if st.button("GUARDAR STOCK", use_container_width=True):
                     if nu:
                         try:
-                            run_query("INSERT INTO stock_playa VALUES (?,?,?,?,?)", (nu, tipo_u, mo, 'En Playa', suc_stock), commit=True)
-                            st.success("Agregado"); time.sleep(0.5); st.rerun()
-                        except Exception as e: st.error(f"Error: {e}")
-                
+                            run_query("INSERT INTO stock_playa VALUES (?,?,?,?,?)",
+                                      (nu, tipo_u, mo, 'En Playa', suc_stock), commit=True)
+                            st.success("Agregado")
+                            time.sleep(0.5)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+
                 st.divider()
                 st.subheader("Eliminar Unidad")
                 try:
@@ -595,54 +613,69 @@ else:
                         if st.button("❌ ELIMINAR", use_container_width=True):
                             run_query("DELETE FROM stock_playa WHERE nro_unit=?", (u_borrar,), commit=True)
                             st.rerun()
-                except: pass
+                except Exception as e:
+                    st.warning(f"No se pudo cargar el listado: {e}")
 
             with c_view:
                 st.subheader(f"Inventario - {st.session_state.suc_ver}")
-                q_stock = "SELECT * FROM stock_playa"
                 if st.session_state.suc_ver != "Todas":
-                    q_stock += f" WHERE sucursal='{st.session_state.suc_ver}'"
-                
-                df_s = pd.DataFrame(run_query(q_stock))
-                if not df_s.empty: df_s.columns = ["nro_unit", "tipo", "modelo", "estado", "sucursal"]
+                    rows_s = run_query("SELECT * FROM stock_playa WHERE sucursal=?", (st.session_state.suc_ver,))
+                else:
+                    rows_s = run_query("SELECT * FROM stock_playa")
+                df_s = pd.DataFrame(rows_s)
+                if not df_s.empty:
+                    df_s.columns = ["nro_unit","tipo","modelo","estado","sucursal"]
                 st.dataframe(df_s, use_container_width=True, height=500)
 
-        with tabs[7]: # VEHÍCULOS
+        # VEHÍCULOS
+        with tabs[7]:
             st.header("🚛 Vehículos")
-            pa = st.text_input("Patente Camión").upper()
+            pa      = st.text_input("Patente Camión").upper()
             suc_veh = st.selectbox("Sucursal Vehículo", ["Sucursal A", "Sucursal B"])
             if st.button("CARGAR CAMIÓN"):
                 if pa:
                     run_query("INSERT INTO vehiculos VALUES (?,?,?)", (pa, "Unidad", suc_veh), commit=True)
                     st.rerun()
-            
-            q_veh = "SELECT * FROM vehiculos"
+
             if st.session_state.suc_ver != "Todas":
-                q_veh += f" WHERE sucursal='{st.session_state.suc_ver}'"
-            df_v = pd.DataFrame(run_query(q_veh))
-            if not df_v.empty: df_v.columns = ["patente", "modelo", "sucursal"]
+                rows_v = run_query("SELECT * FROM vehiculos WHERE sucursal=?", (st.session_state.suc_ver,))
+            else:
+                rows_v = run_query("SELECT * FROM vehiculos")
+            df_v = pd.DataFrame(rows_v)
+            if not df_v.empty:
+                df_v.columns = ["patente","modelo","sucursal"]
             st.table(df_v)
 
-        with tabs[8]: # USUARIOS
+        # USUARIOS
+        with tabs[8]:
             st.header("👥 Gestión de Usuarios")
             with st.form("new_user"):
                 c1, c2, c3, c4 = st.columns(4)
-                un = c1.text_input("Nuevo Usuario")
-                pn = c2.text_input("Clave", type="password")
-                rol = c3.selectbox("Rol", ["Operador", "Administrador"])
+                un       = c1.text_input("Nuevo Usuario")
+                pn       = c2.text_input("Clave", type="password")
+                rol_new  = c3.selectbox("Rol", ["Operador", "Administrador"])
                 suc_user = c4.selectbox("Sucursal", ["Sucursal A", "Sucursal B", "Todas"])
                 if st.form_submit_button("CREAR USUARIO"):
                     if un and pn:
-                        run_query("INSERT INTO usuarios VALUES (?,?,?,?)", (un, pn, rol, suc_user), commit=True)
-                        st.success(f"Usuario {un} creado."); time.sleep(1); st.rerun()
-            
+                        run_query("INSERT INTO usuarios VALUES (?,?,?,?)",
+                                  (un, hash_password(pn), rol_new, suc_user), commit=True)
+                        st.success(f"Usuario {un} creado.")
+                        time.sleep(1)
+                        st.rerun()
+
             st.subheader("Usuarios Existentes")
             df_users = pd.DataFrame(run_query("SELECT user, rol, sucursal FROM usuarios"))
-            if not df_users.empty: df_users.columns = ["user", "rol", "sucursal"]
+            if not df_users.empty:
+                df_users.columns = ["user","rol","sucursal"]
             st.dataframe(df_users, use_container_width=True)
-            
-            u_del = st.selectbox("Seleccionar usuario para eliminar", [""] + df_users['user'].tolist() if not df_users.empty else [""])
+
+            u_del = st.selectbox(
+                "Seleccionar usuario para eliminar",
+                [""] + df_users['user'].tolist() if not df_users.empty else [""]
+            )
             if st.button("🗑️ ELIMINAR USUARIO"):
-                if u_del and u_del != "admin":
+                if u_del and u_del != "marcelo":
                     run_query("DELETE FROM usuarios WHERE user=?", (u_del,), commit=True)
-                    st.success(f"Usuario {u_del} eliminado."); time.sleep(1); st.rerun()
+                    st.success(f"Usuario {u_del} eliminado.")
+                    time.sleep(1)
+                    st.rerun()
