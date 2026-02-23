@@ -36,7 +36,7 @@ IS_CLOUD = 'STREAMLIT_RUNTIME_ENV' in os.environ or os.path.exists('.streamlit/s
 @st.cache_resource
 def get_db_connection():
     if not IS_CLOUD:
-        return sqlite3.connect('gestion_banos.db', check_same_thread=False)
+        return sqlite3.connect('gestion_banos.db', check_same_thread=False, timeout=30)
     else:
         if not HAS_GSHEETS:
             st.error("❌ Error: La librería 'st-gsheets-connection' no está instalada. Ejecuta 'pip install st-gsheets-connection' en tu terminal.")
@@ -60,7 +60,7 @@ def run_query(query, params=(), commit=False):
                     return True
                 return c.fetchall()
             except sqlite3.OperationalError as e:
-                if "locked" in str(e): time.sleep(0.1)
+                if "locked" in str(e): time.sleep(0.5)
                 else: raise e
         raise sqlite3.OperationalError("Database is locked")
     else:
@@ -236,6 +236,12 @@ except Exception as e:
             st.warning(f"⚠️ Nota: Problema al conectar Google Sheets. Detalles: {err_str if err_str else 'Error desconocido (posiblemente falta habilitar Google Drive API)'}")
     else:
         st.error(f"Error al inicializar base de datos: {e}")
+        if "drive.googleapis.com" in str(e).lower():
+            st.error("🚨 **API de Google Drive Deshabilitada**")
+            st.markdown("""
+            Para solucionar esto, haz clic en el siguiente enlace y presiona el botón **HABILITAR**: 
+            👉 [Habilitar Google Drive API](https://console.developers.google.com/apis/api/drive.googleapis.com/overview?project=827997471611)
+            """)
 
 # --- CONFIGURACIÓN DE GPS ---
 geolocator = Nominatim(user_agent="servicios_logistica_v1_fix")
@@ -309,7 +315,14 @@ if not st.session_state.login:
                                 for d in detalles_errores: st.write(d)
                         
                         st.error("🚨 La app no encuentra las hojas en tu Excel.")
-                        st.info("Para solucionar esto:\n1. Asegúrate de que tu Excel tenga una pestaña llamada **usuarios** abajo.\n2. Asegúrate de haber habilitado **Google Drive API** además de Sheets API en Google Cloud Console.")
+                        st.markdown(f"""
+### 🛠️ Pasos para solucionar el problema:
+
+1. **Seleccionar Proyecto**: Arriba de todo en Google Cloud, asegúrate de haber seleccionado el proyecto: 
+   👉 **`{proj_id}`**
+2. **Habilitar API**: Ve a [este buscador](https://console.cloud.google.com/apis/library) y escribe **Google Drive API**.
+3. **Pestaña Excel**: Verifica que tu Excel tenga la pestaña llamada **`usuarios`** abajo.
+""")
                         if detalles_errores:
                             with st.expander("🔍 Ver detalles técnicos de los errores"):
                                 for d in detalles_errores: st.write(d)
