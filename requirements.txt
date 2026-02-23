@@ -9,3 +9,4 @@ st-gsheets-connection
 duckdb
 google-auth
 gspread
+psycopg2-binary
