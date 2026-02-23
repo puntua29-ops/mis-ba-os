@@ -78,122 +78,6 @@ def run_query(query, params=(), commit=False):
         if conn:
             conn.close()
 
-def _init_db_once():
-    """Inicialización legacy (ahora manejada por Supabase)."""
-    return True
-
-def init_db_cloud():
-    """Inicialización legacy."""
-    return True
-
-
-# ─────────────────────────────────────────────
-# INICIALIZACIÓN DE TABLAS
-# También usa el recurso cacheado para evitar
-# conflictos durante el arranque.
-# ─────────────────────────────────────────────
-
-@st.cache_resource
-def _init_db_once():
-    """Crea las tablas y el usuario admin UNA sola vez por proceso."""
-    if IS_CLOUD:
-        return  # La inicialización cloud se maneja en init_db_cloud()
-
-    conn, lock = _get_sqlite_resources()
-    with lock:
-        c = conn.cursor()
-        # Crear tablas
-        c.execute("""CREATE TABLE IF NOT EXISTS usuarios
-                     (user TEXT PRIMARY KEY, password TEXT, rol TEXT, sucursal TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS vehiculos
-                     (patente TEXT PRIMARY KEY, modelo TEXT, sucursal TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS viajes
-                     (id INTEGER PRIMARY KEY, fecha TEXT, cliente TEXT, patente TEXT,
-                      destino TEXT, tipo_mov TEXT, unidades TEXT, cantidad INTEGER,
-                      tipo_contrato TEXT, km_entrega REAL, precio_unit REAL, total REAL,
-                      estado_pago TEXT, lat REAL, lon REAL, sucursal TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS stock_playa
-                     (nro_unit TEXT PRIMARY KEY, tipo TEXT, modelo TEXT, estado TEXT, sucursal TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS personal
-                     (id INTEGER PRIMARY KEY, fecha TEXT, nombre TEXT, tarea TEXT, pago REAL, sucursal TEXT)""")
-        c.execute("""CREATE TABLE IF NOT EXISTS gastos
-                     (id INTEGER PRIMARY KEY, fecha TEXT, patente TEXT, concepto TEXT, monto REAL, sucursal TEXT)""")
-
-        # Migración: agregar columna sucursal si falta en alguna tabla
-        for tabla in ["usuarios","vehiculos","viajes","stock_playa","personal","gastos"]:
-            try:
-                c.execute(f"PRAGMA table_info({tabla})")
-                cols_actuales = [row[1] for row in c.fetchall()]
-                if "sucursal" not in cols_actuales:
-                    c.execute(f"ALTER TABLE {tabla} ADD COLUMN sucursal TEXT DEFAULT 'Sucursal A'")
-            except Exception:
-                pass
-
-        conn.commit()
-
-        # Insertar usuario administrador si no existe
-        try:
-            c.execute(
-                "INSERT INTO usuarios VALUES (?, ?, 'Administrador', 'Todas')",
-                ('marcelo', hash_password('@Lex2110'))
-            )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            pass  # Ya existe, no hay problema
-
-    return True
-
-def init_db_cloud():
-    """Inicialización para Google Sheets (cloud)."""
-    gconn = get_gsheets_connection()
-    if not gconn:
-        return
-    tablas = {
-        "usuarios":   ["user","password","rol","sucursal"],
-        "vehiculos":  ["patente","modelo","sucursal"],
-        "viajes":     ["id","fecha","cliente","patente","destino","tipo_mov","unidades",
-                       "cantidad","tipo_contrato","km_entrega","precio_unit","total",
-                       "estado_pago","lat","lon","sucursal"],
-        "stock_playa":["nro_unit","tipo","modelo","estado","sucursal"],
-        "personal":   ["id","fecha","nombre","tarea","pago","sucursal"],
-        "gastos":     ["id","fecha","patente","concepto","monto","sucursal"]
-    }
-    for nombre, cols in tablas.items():
-        try:
-            df_actual = gconn.read(worksheet=nombre, ttl=0)
-            missing = [c for c in cols if c not in df_actual.columns]
-            if missing:
-                for col in missing:
-                    df_actual[col] = "Todas" if nombre == "usuarios" else "Sucursal A"
-                gconn.update(worksheet=nombre, data=df_actual)
-        except Exception as e:
-            if "Worksheet not found" in str(e) or "404" in str(e):
-                try:
-                    df_init = pd.DataFrame(columns=cols)
-                    if nombre == "usuarios":
-                        df_init.loc[0] = ["marcelo", hash_password("@Lex2110"), "Administrador", "Todas"]
-                    gconn.update(worksheet=nombre, data=df_init)
-                except Exception as e2:
-                    st.error(f"❌ No se pudo crear la pestaña '{nombre}': {e2}")
-            else:
-                st.error(f"❌ Error al verificar pestaña '{nombre}': {e}")
-
-# ── Ejecutar inicialización ──────────────────
-try:
-    if IS_CLOUD:
-        init_db_cloud()
-    else:
-        _init_db_once()  # cached: corre solo una vez
-except Exception as e:
-    err_str = str(e)
-    if IS_CLOUD:
-        if "403" in err_str or "PERMISSION_DENIED" in err_str:
-            st.error("🔒 Sin permisos de escritura en Google Sheets.")
-        else:
-            st.warning(f"⚠️ Problema al conectar Google Sheets: {err_str}")
-    else:
-        st.error(f"Error al inicializar base de datos: {err_str}")
-
 # ─────────────────────────────────────────────
 # GPS
 # ─────────────────────────────────────────────
@@ -230,16 +114,13 @@ if not st.session_state.login:
 
     with st.expander("🛠️ Diagnóstico de Conexión"):
         st.write(f"**Entorno:** {'Nube (Cloud)' if IS_CLOUD else 'Local (PC)'}")
-        st.write(f"**Librería GSheets:** {'✅ Instalada' if HAS_GSHEETS else '❌ No encontrada'}")
-        if not IS_CLOUD:
-            st.write(f"**Archivo DB:** `{os.path.abspath(DB_PATH)}`")
-            st.write(f"**Existe:** {'✅ Sí' if os.path.exists(DB_PATH) else '❌ No'}")
-        if IS_CLOUD:
-            gconn = get_gsheets_connection()
-            if gconn:
-                st.success("✅ Conexión con Google Sheets establecida")
-            else:
-                st.error("❌ No se pudo conectar con Google Sheets.")
+        st.write(f"**Base de Datos:** Supabase (PostgreSQL)")
+        try:
+            conn = get_connection()
+            st.success("✅ Conexión con Supabase establecida correctamente.")
+            conn.close()
+        except Exception as e:
+            st.error(f"❌ Error al conectar con Supabase: {e}")
 
 else:
     # ─────────────────────────────────────────────
@@ -283,17 +164,17 @@ else:
         st.header("Registro de Movimiento")
 
         if st.session_state.suc_ver != "Todas":
-            v_list = [r[0] for r in run_query("SELECT patente FROM vehiculos WHERE sucursal=?", (st.session_state.suc_ver,))]
+            v_list = [r['patente'] for r in run_query("SELECT patente FROM vehiculos WHERE sucursal=%s", (st.session_state.suc_ver,))]
         else:
-            v_list = [r[0] for r in run_query("SELECT patente FROM vehiculos")]
+            v_list = [r['patente'] for r in run_query("SELECT patente FROM vehiculos")]
 
         mov        = st.radio("Acción", ["Entregado", "Retirado"], horizontal=True)
         est_buscar = "En Playa" if mov == "Entregado" else "En Calle"
 
         if st.session_state.suc_ver == "Todas":
-            u_dispo = [r[0] for r in run_query("SELECT nro_unit FROM stock_playa WHERE estado=?", (est_buscar,))]
+            u_dispo = [r['nro_unit'] for r in run_query("SELECT nro_unit FROM stock_playa WHERE estado=%s", (est_buscar,))]
         else:
-            u_dispo = [r[0] for r in run_query("SELECT nro_unit FROM stock_playa WHERE estado=? AND sucursal=?", (est_buscar, st.session_state.suc_ver))]
+            u_dispo = [r['nro_unit'] for r in run_query("SELECT nro_unit FROM stock_playa WHERE estado=%s AND sucursal=%s", (est_buscar, st.session_state.suc_ver))]
 
         with st.form("form_viajes"):
             c1, c2 = st.columns(2)
@@ -429,7 +310,7 @@ else:
     # ─────────────────────────────────────────────
     with tabs[4]:
         st.header("⛽ Gastos")
-        v_list_g = [r[0] for r in run_query("SELECT patente FROM vehiculos WHERE sucursal=?", (st.session_state.sucursal,))]
+        v_list_g = [r['patente'] for r in run_query("SELECT patente FROM vehiculos WHERE sucursal=%s", (st.session_state.sucursal,))]
         with st.form("gastos_f"):
             c1, c2, c3 = st.columns(3)
             g_pat = c1.selectbox("Vehículo", v_list_g if v_list_g else ["S/P"])
