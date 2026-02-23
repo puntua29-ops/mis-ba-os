@@ -6,3 +6,4 @@ streamlit-folium
 openpyxl
 xlsxwriter
 st-gsheets-connection
+duckdb
