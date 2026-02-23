@@ -121,7 +121,14 @@ def run_query(query, params=(), commit=False):
                     elif "usuarios" in q_lower:
                         df = df[df['user'] != params[0]]
                 
-                conn.update(worksheet=tabla_target, data=df)
+                try:
+                    conn.update(worksheet=tabla_target, data=df)
+                except Exception as e:
+                    if "UnsupportedOperationError" in str(type(e).__name__):
+                        st.error("🔒 Error de Escritura: La conexión actual es de 'Solo Lectura'. Para guardar datos en la nube necesitas configurar una 'Service Account' en los Secrets de Streamlit.")
+                    else:
+                        st.error(f"Error al guardar en GSheets: {e}")
+                    return False
                 return True
         except Exception as e:
             if "Worksheet not found" in str(e): return []
@@ -199,7 +206,13 @@ def init_db():
                 conn.update(worksheet=nombre, data=df_init)
 
 # Ejecutar inicialización al arranque
-init_db()
+try:
+    init_db()
+except Exception as e:
+    if IS_CLOUD:
+        st.warning(f"⚠️ Nota: No se pudo inicializar/verificar Google Sheets (Posible modo Solo Lectura). Detalles: {e}")
+    else:
+        st.error(f"Error al inicializar base de datos: {e}")
 
 # --- CONFIGURACIÓN DE GPS ---
 geolocator = Nominatim(user_agent="servicios_logistica_v1_fix")
@@ -530,5 +543,3 @@ else:
                 if u_del and u_del != "admin":
                     run_query("DELETE FROM usuarios WHERE user=?", (u_del,), commit=True)
                     st.success(f"Usuario {u_del} eliminado."); time.sleep(1); st.rerun()
-
-
